@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # NexusCafe Smart Self-Healing Installation Script
-# Version: 2.0.0
+# Version: 3.0.0
 # Author: NexusCafe Team
 
 set -e  # Exit on error (though we handle errors internally)
@@ -118,9 +118,11 @@ check_selinux_status() {
     fi
 }
 
-check_system_readiness() {
-    local issues=0
-    local warnings=0
+check_environment() {
+    if [ "$EUID" -ne 0 ]; then
+        log_error "Please run as root (sudo ./install-nexuscafe.sh)"
+        exit 1
+    fi
     
     if ! command_exists bc; then dnf install -y bc jq >/dev/null 2>&1 || true; fi
     if ! command_exists netstat; then dnf install -y net-tools >/dev/null 2>&1 || true; fi
@@ -129,40 +131,31 @@ check_system_readiness() {
         log_warning "OS may not be AlmaLinux/RHEL compatible. Checking versions..."
     fi
     
+    local disk_space=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+    if [ "$disk_space" -lt 10 ]; then
+        log_error "Insufficient disk space: ${disk_space}GB (minimum 10GB required)"
+        cleanup_disk_space
+        disk_space=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+        if [ "$disk_space" -lt 10 ]; then exit 1; fi
+    fi
+    
     local total_ram=$(free -g | awk '/^Mem:/{print $2}')
     if [ "$total_ram" -lt 4 ]; then
         log_warning "Low RAM: ${total_ram}GB (minimum 4GB recommended)"
-        warnings=$((warnings + 1))
         if [ "$total_ram" -lt 2 ]; then
             create_swap_file 2048
         fi
     fi
     
-    local disk_space=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
-    if [ "$disk_space" -lt 10 ]; then
-        log_error "Critical: Only ${disk_space}GB free disk space. 20GB+ required."
-        issues=$((issues + 1))
-        cleanup_disk_space
-    elif [ "$disk_space" -lt 20 ]; then
-        log_warning "Low disk space: ${disk_space}GB (recommended 20GB+)"
-        warnings=$((warnings + 1))
-    fi
-    
     if ! ping -c 1 8.8.8.8 >/dev/null 2>&1; then
         log_error "No internet connectivity. Installation requires internet access."
-        issues=$((issues + 1))
-    else
-        if ! curl -s -o /dev/null -w "%{http_code}" https://github.com | grep -q "200\|301\|302"; then
-            log_warning "GitHub may be blocked. Using fallback mirror..."
-            REPO_URL="https://gitlab.com/meedo51/NexusCafe.git" 
-        fi
+        exit 1
     fi
     
     check_firewall_ports
     check_conflicting_services
     check_selinux_status
-    
-    return $issues
+    log_success "Environment checks passed"
 }
 
 optimize_environment() {
@@ -236,6 +229,33 @@ smart_install() {
     return 1
 }
 
+smart_install_base_tools() {
+    log_info "Installing base tools with smart fallback..."
+    
+    local tools=(
+        "git curl wget vim nano htop net-tools"
+        "gcc-c++ make python3 python3-pip"
+        "certbot python3-certbot-nginx"
+        "nginx"
+        "postgresql-server postgresql-contrib"
+        "fail2ban"
+    )
+    
+    for tool_group in "${tools[@]}"; do
+        for tool in $tool_group; do
+            if ! command_exists $tool; then
+                log_info "Installing: $tool"
+                dnf install -y $tool >/dev/null 2>&1 || \
+                dnf install -y --skip-broken $tool >/dev/null 2>&1 || \
+                log_warning "Failed to install: $tool"
+            fi
+        done
+    done
+    
+    log_success "Base tools installation completed"
+    return 0
+}
+
 smart_install_node() {
     local required_version="20"
     
@@ -262,6 +282,417 @@ smart_install_node() {
     
     log_error "Failed to install Node.js after trying all methods"
     return 1
+}
+
+# ------------------------------
+# Redis Installation
+# ------------------------------
+
+smart_install_redis() {
+    log_info "Installing Redis with smart fallback..."
+    
+    local max_attempts=3
+    local attempt=0
+    local install_methods=(
+        "dnf_default"
+        "dnf_epel"
+        "dnf_redis6"
+        "dnf_redis7"
+        "source_compile"
+        "docker"
+    )
+    
+    for method in "${install_methods[@]}"; do
+        attempt=$((attempt + 1))
+        log_info "Redis installation attempt $attempt: $method"
+        
+        case $method in
+            "dnf_default")
+                if dnf install -y redis >/dev/null 2>&1; then
+                    log_success "Redis installed via DNF default"
+                    return 0
+                fi
+                ;;
+                
+            "dnf_epel")
+                log_info "Enabling EPEL repository and installing Redis..."
+                dnf install -y epel-release >/dev/null 2>&1
+                dnf install -y redis >/dev/null 2>&1 || dnf install -y redis6 >/dev/null 2>&1 || dnf install -y redis7 >/dev/null 2>&1
+                if command_exists redis-server; then
+                    log_success "Redis installed via EPEL"
+                    return 0
+                fi
+                ;;
+                
+            "dnf_redis6")
+                log_info "Installing Redis 6 from alternative repository..."
+                dnf install -y redis6 >/dev/null 2>&1
+                if command_exists redis-server; then
+                    log_success "Redis 6 installed"
+                    return 0
+                fi
+                ;;
+                
+            "dnf_redis7")
+                log_info "Installing Redis 7 from alternative repository..."
+                dnf install -y redis7 >/dev/null 2>&1
+                if command_exists redis-server; then
+                    log_success "Redis 7 installed"
+                    return 0
+                fi
+                ;;
+                
+            "source_compile")
+                log_info "Compiling Redis from source..."
+                local redis_version="7.2.4"
+                local redis_dir="/tmp/redis-${redis_version}"
+                
+                dnf install -y gcc make wget tar >/dev/null 2>&1
+                
+                wget -q -O /tmp/redis-${redis_version}.tar.gz https://download.redis.io/releases/redis-${redis_version}.tar.gz
+                tar -xzf /tmp/redis-${redis_version}.tar.gz -C /tmp/
+                cd ${redis_dir}
+                make -j$(nproc) >/dev/null 2>&1
+                make install >/dev/null 2>&1
+                
+                mkdir -p /etc/redis /var/lib/redis /var/log/redis
+                useradd -r -s /sbin/nologin redis 2>/dev/null || true
+                chown redis:redis /var/lib/redis /var/log/redis
+                
+                cat > /etc/systemd/system/redis.service << 'EOF'
+[Unit]
+Description=Redis In-Memory Data Store
+After=network.target
+[Service]
+User=redis
+Group=redis
+ExecStart=/usr/local/bin/redis-server /etc/redis/redis.conf
+ExecStop=/usr/local/bin/redis-cli shutdown
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+                
+                cat > /etc/redis/redis.conf << 'EOF'
+bind 127.0.0.1
+port 6379
+daemonize no
+pidfile /var/run/redis_6379.pid
+logfile /var/log/redis/redis.log
+dir /var/lib/redis
+maxmemory 256mb
+maxmemory-policy allkeys-lru
+appendonly yes
+appendfilename "appendonly.aof"
+EOF
+                
+                systemctl daemon-reload
+                systemctl enable redis
+                
+                if command_exists redis-server; then
+                    log_success "Redis compiled and installed successfully"
+                    return 0
+                fi
+                ;;
+                
+            "docker")
+                log_info "Installing Redis via Docker..."
+                if ! command_exists docker; then
+                    dnf install -y docker >/dev/null 2>&1
+                    systemctl start docker
+                    systemctl enable docker
+                fi
+                
+                docker pull redis:alpine >/dev/null 2>&1
+                docker run -d \
+                    --name redis-nexuscafe \
+                    --restart always \
+                    -p 6379:6379 \
+                    -v redis-data:/data \
+                    redis:alpine \
+                    redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru >/dev/null 2>&1
+                
+                sleep 5
+                if docker exec redis-nexuscafe redis-cli ping >/dev/null 2>&1; then
+                    log_success "Redis running in Docker container"
+                    return 0
+                fi
+                ;;
+        esac
+        log_warning "Redis installation method '$method' failed"
+    done
+    
+    log_error "All Redis installation methods failed"
+    return 1
+}
+
+configure_redis() {
+    log_info "Configuring Redis..."
+    
+    if docker ps | grep -q redis-nexuscafe; then
+        log_success "Redis via Docker is configured and running"
+        return 0
+    fi
+    
+    if redis-cli ping >/dev/null 2>&1; then
+        log_success "Redis is already running"
+        return 0
+    fi
+    
+    local redis_bin=$(which redis-server 2>/dev/null || echo "/usr/local/bin/redis-server")
+    if [ ! -f "$redis_bin" ]; then
+        log_error "Redis binary not found"
+        return 1
+    fi
+    
+    mkdir -p /var/lib/redis /var/log/redis /etc/redis
+    chown -R redis:redis /var/lib/redis /var/log/redis 2>/dev/null || true
+    
+    cat > /etc/redis/redis.conf << 'EOF'
+bind 127.0.0.1
+port 6379
+daemonize no
+pidfile /var/run/redis_6379.pid
+logfile /var/log/redis/redis.log
+dir /var/lib/redis
+maxmemory 256mb
+maxmemory-policy allkeys-lru
+appendonly yes
+appendfilename "appendonly.aof"
+timeout 300
+tcp-keepalive 60
+EOF
+    
+    if systemctl start redis 2>/dev/null; then
+        log_success "Redis started via systemd"
+    elif $redis_bin /etc/redis/redis.conf --daemonize yes 2>/dev/null; then
+        log_success "Redis started directly"
+    else
+        log_error "Failed to start Redis"
+        return 1
+    fi
+    
+    sleep 3
+    if redis-cli ping >/dev/null 2>&1; then
+        log_success "Redis is running and responding"
+        return 0
+    else
+        log_error "Redis started but not responding"
+        return 1
+    fi
+}
+
+# ------------------------------
+# MinIO Installation
+# ------------------------------
+
+smart_install_minio() {
+    log_info "Installing MinIO with smart fallback..."
+    
+    local install_methods=(
+        "download_binary"
+        "rpm_install"
+        "docker"
+    )
+    
+    for method in "${install_methods[@]}"; do
+        log_info "MinIO installation method: $method"
+        
+        case $method in
+            "download_binary")
+                log_info "Downloading MinIO binary..."
+                local minio_url="https://dl.min.io/server/minio/release/linux-amd64/minio"
+                
+                curl -L -o /usr/local/bin/minio "$minio_url" --retry 3 --retry-delay 5 -s
+                chmod +x /usr/local/bin/minio
+                
+                if /usr/local/bin/minio --version >/dev/null 2>&1; then
+                    log_success "MinIO binary downloaded successfully"
+                    return 0
+                fi
+                ;;
+                
+            "rpm_install")
+                log_info "Installing MinIO via RPM..."
+                local rpm_url="https://dl.min.io/server/minio/release/linux-amd64/minio-2024.01.16T21-33-51Z.x86_64.rpm"
+                dnf install -y "$rpm_url" >/dev/null 2>&1 || \
+                dnf install -y "https://dl.min.io/server/minio/release/linux-amd64/minio-latest.rpm" >/dev/null 2>&1
+                
+                if command_exists minio; then
+                    log_success "MinIO installed via RPM"
+                    return 0
+                fi
+                ;;
+                
+            "docker")
+                log_info "Installing MinIO via Docker..."
+                if ! command_exists docker; then
+                    dnf install -y docker >/dev/null 2>&1
+                    systemctl start docker
+                    systemctl enable docker
+                fi
+                
+                docker pull minio/minio >/dev/null 2>&1
+                docker run -d \
+                    --name minio-nexuscafe \
+                    --restart always \
+                    -p $MINIO_PORT:9000 \
+                    -p $MINIO_CONSOLE_PORT:9001 \
+                    -e MINIO_ROOT_USER=nexuscafe-admin \
+                    -e MINIO_ROOT_PASSWORD=${MINIO_PASSWORD} \
+                    -v minio-data:/data \
+                    minio/minio server /data --console-address ":9001" >/dev/null 2>&1
+                
+                sleep 10
+                if docker ps | grep -q minio-nexuscafe; then
+                    log_success "MinIO running in Docker container"
+                    return 0
+                fi
+                ;;
+        esac
+    done
+    
+    log_error "All MinIO installation methods failed"
+    return 1
+}
+
+configure_minio() {
+    log_info "Configuring MinIO..."
+    
+    if docker ps | grep -q minio-nexuscafe; then
+        log_success "MinIO via Docker is configured and running"
+        return 0
+    fi
+    
+    local minio_bin=$(which minio 2>/dev/null || echo "/usr/local/bin/minio")
+    if [ ! -f "$minio_bin" ]; then
+        log_error "MinIO binary not found"
+        return 1
+    fi
+    
+    mkdir -p /var/lib/minio /var/log/minio /etc/minio
+    if ! id -u minio-user >/dev/null 2>&1; then
+        useradd -r -s /sbin/nologin minio-user
+    fi
+    chown -R minio-user:minio-user /var/lib/minio /var/log/minio
+    
+    if [ -z "$MINIO_PASSWORD" ]; then
+        MINIO_PASSWORD=$(generate_password)
+    fi
+    
+    cat > /etc/minio/minio.conf << EOF
+MINIO_VOLUMES="/var/lib/minio"
+MINIO_OPTS="--address :${MINIO_PORT} --console-address :${MINIO_CONSOLE_PORT}"
+MINIO_ROOT_USER=nexuscafe-admin
+MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
+EOF
+    
+    cat > /etc/systemd/system/minio.service << 'EOF'
+[Unit]
+Description=MinIO Object Storage
+Documentation=https://min.io/docs/minio/linux/index.html
+Wants=network-online.target
+After=network-online.target
+[Service]
+User=minio-user
+Group=minio-user
+EnvironmentFile=-/etc/minio/minio.conf
+ExecStart=/usr/local/bin/minio server $MINIO_OPTS
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable minio >/dev/null 2>&1
+    
+    local max_start_attempts=3
+    local attempt=0
+    
+    while [ $attempt -lt $max_start_attempts ]; do
+        attempt=$((attempt + 1))
+        log_info "Starting MinIO (attempt $attempt/$max_start_attempts)..."
+        
+        rm -f /var/lib/minio/.minio.sys/*/lock 2>/dev/null
+        
+        if systemctl start minio 2>/dev/null; then
+            sleep 5
+            if systemctl is-active --quiet minio; then
+                log_success "MinIO started via systemd"
+                return 0
+            fi
+        fi
+        
+        log_info "Attempting direct MinIO start..."
+        $minio_bin server /var/lib/minio --address :${MINIO_PORT} --console-address :${MINIO_CONSOLE_PORT} &
+        sleep 5
+        
+        if curl -s -o /dev/null http://localhost:${MINIO_PORT}/minio/health/ready; then
+            log_success "MinIO started directly"
+            return 0
+        fi
+        sleep 5
+    done
+    
+    log_error "Failed to start MinIO after $max_start_attempts attempts"
+    return 1
+}
+
+setup_minio_buckets() {
+    log_info "Setting up MinIO buckets..."
+    
+    local max_wait=30
+    local wait_count=0
+    
+    while [ $wait_count -lt $max_wait ]; do
+        if curl -s -o /dev/null http://localhost:${MINIO_PORT}/minio/health/ready; then
+            break
+        fi
+        wait_count=$((wait_count + 1))
+        sleep 1
+    done
+    
+    if [ $wait_count -eq $max_wait ]; then
+        log_warning "MinIO not ready after ${max_wait}s, skipping bucket creation"
+        return 1
+    fi
+    
+    if ! command_exists mc; then
+        curl -L -o /usr/local/bin/mc "https://dl.min.io/client/mc/release/linux-amd64/mc" -s
+        chmod +x /usr/local/bin/mc
+    fi
+    
+    mc alias set local http://localhost:${MINIO_PORT} nexuscafe-admin ${MINIO_PASSWORD} >/dev/null 2>&1
+    
+    for bucket in nexuscafe-images nexuscafe-receipts nexuscafe-backups; do
+        if ! mc ls local/$bucket >/dev/null 2>&1; then
+            mc mb local/$bucket >/dev/null 2>&1
+            mc policy set public local/$bucket >/dev/null 2>&1 || true
+            log_success "Bucket created: $bucket"
+        else
+            log_info "Bucket already exists: $bucket"
+        fi
+    done
+    
+    log_success "MinIO buckets configured"
+    return 0
+}
+
+cleanup_minio() {
+    log_info "Cleaning up MinIO installation..."
+    systemctl stop minio 2>/dev/null || true
+    pkill minio 2>/dev/null || true
+    docker stop minio-nexuscafe 2>/dev/null || true
+    docker rm minio-nexuscafe 2>/dev/null || true
+    rm -f /usr/local/bin/minio 2>/dev/null || true
+    rm -f /usr/local/bin/mc 2>/dev/null || true
+    rm -rf /var/lib/minio 2>/dev/null || true
+    rm -rf /etc/minio 2>/dev/null || true
+    rm -f /etc/systemd/system/minio.service 2>/dev/null || true
+    log_info "MinIO cleanup completed"
 }
 
 # ------------------------------
@@ -357,307 +788,11 @@ smart_migrate_database() {
 }
 
 # ------------------------------
-# Service Management
+# Configuration & Deployment
 # ------------------------------
 
-check_disk_space_for_postgres() { true; }
-check_nginx_config() { nginx -t >/dev/null 2>&1 || return 1; }
-check_minio_config() { true; }
-
-smart_service_start() {
-    local service="$1"
-    local max_attempts=5
-    local attempt=0
-    
-    case $service in
-        "postgresql") check_disk_space_for_postgres ;;
-        "nginx") check_nginx_config || true ;;
-        "minio") check_minio_config ;;
-    esac
-    
-    while [ $attempt -lt $max_attempts ]; do
-        attempt=$((attempt + 1))
-        if systemctl start "$service" >/dev/null 2>&1; then
-            sleep 3
-            if systemctl is-active --quiet "$service"; then
-                log_success "$service started successfully"
-                return 0
-            fi
-        fi
-        
-        log_warning "Failed to start $service (attempt $attempt/$max_attempts)"
-        
-        case $service in
-            "postgresql")
-                rm -f /var/lib/pgsql/data/postmaster.pid || true
-                sudo -u postgres pg_ctl -D /var/lib/pgsql/data start >/dev/null 2>&1 || true
-                ;;
-            "nginx")
-                if ! nginx -t >/dev/null 2>&1; then
-                    mv /etc/nginx/conf.d/*.conf /tmp/ 2>/dev/null || true
-                fi
-                ;;
-            "redis")
-                rm -f /var/lib/redis/dump.rdb /var/lib/redis/appendonly.aof || true
-                ;;
-            "minio")
-                chown -R minio-user:minio-user /var/lib/minio || true
-                ;;
-        esac
-        sleep 5
-    done
-    
-    log_error "Failed to start $service after $max_attempts attempts"
-    return 1
-}
-
-monitor_services() {
-    local unhealthy=()
-    for service in nginx postgresql redis minio; do
-        if ! systemctl is-active --quiet "$service"; then
-            unhealthy+=("$service")
-            smart_service_start "$service" || true
-        fi
-    done
-    
-    if ! curl -s -o /dev/null -w "%{http_code}" http://localhost:$BACKEND_PORT/health | grep -q "200"; then
-        pm2 restart nexuscafe >/dev/null 2>&1 || true
-        sleep 5
-    fi
-    
-    if [ ${#unhealthy[@]} -gt 0 ]; then return 1; fi
-    return 0
-}
-
-# ------------------------------
-# Troubleshooting & Recovery
-# ------------------------------
-
-gather_diagnostics() {
-    log_info "🔍 Gathering diagnostic information..."
-    echo "=== System Information ==="
-    cat /etc/os-release | grep PRETTY_NAME
-    uname -a
-    free -h
-    df -h /
-    echo "=== Service Status ==="
-    for s in nginx postgresql redis minio; do systemctl is-active $s || echo "$s stopped"; done
-    pm2 status || true
-    echo "=== Recent Error Logs ==="
-    tail -n 20 $LOG_DIR/install.log 2>/dev/null || true
-}
-
-self_healing_recovery() {
-    local failed_step="$1"
-    local max_recovery_attempts=3
-    local attempt=1
-    
-    log_warning "🔄 Attempting self-healing recovery for step: $failed_step"
-    
-    while [ $attempt -le $max_recovery_attempts ]; do
-        log_info "Recovery attempt $attempt/$max_recovery_attempts..."
-        
-        case $failed_step in
-            "system_update")
-                dnf clean all >/dev/null 2>&1; dnf makecache >/dev/null 2>&1; dnf update -y >/dev/null 2>&1 && return 0
-                ;;
-            "postgresql_setup")
-                systemctl stop postgresql || true
-                rm -rf /var/lib/pgsql/data
-                postgresql-setup --initdb >/dev/null 2>&1 || true
-                systemctl start postgresql || true
-                smart_postgres_setup && return 0
-                ;;
-            "nginx_config")
-                if ! nginx -t >/dev/null 2>&1; then
-                    mv /etc/nginx/conf.d/${DOMAIN}.conf /etc/nginx/conf.d/${DOMAIN}.conf.bak || true
-                    systemctl start nginx || true
-                fi
-                return 0
-                ;;
-            "app_deployment")
-                rm -rf $INSTALL_DIR/{node_modules,dist,build} || true
-                cd $INSTALL_DIR && npm install >/dev/null 2>&1 && npm run build >/dev/null 2>&1 && return 0
-                ;;
-            "pm2_startup")
-                pm2 kill >/dev/null 2>&1 || true
-                cd $INSTALL_DIR && pm2 start ecosystem.config.js >/dev/null 2>&1 && pm2 save >/dev/null 2>&1 && return 0
-                ;;
-            *)
-                return 1
-                ;;
-        esac
-        attempt=$((attempt + 1))
-        sleep 5
-    done
-    return 1
-}
-
-# ------------------------------
-# Verification & Performance
-# ------------------------------
-
-verify_installation() {
-    local errors=0
-    log_info "🔍 Verifying installation..."
-    
-    for service in nginx postgresql redis minio; do
-        if systemctl is-active --quiet "$service"; then
-            log_success "✅ $service is running"
-        else
-            log_error "❌ $service is not running"
-            errors=$((errors + 1))
-        fi
-    done
-    
-    if pm2 status | grep -q "online"; then
-        log_success "✅ Application is running"
-    else
-        log_error "❌ Application is not running"
-        errors=$((errors + 1))
-    fi
-    
-    if sudo -u postgres psql -c "SELECT 1" >/dev/null 2>&1; then
-        log_success "✅ Database is accessible"
-    else
-        log_error "❌ Database is not accessible"
-        errors=$((errors + 1))
-    fi
-    
-    if [ $errors -eq 0 ]; then
-        log_success "🎉 All core checks passed!"
-        return 0
-    else
-        return 1
-    fi
-}
-
-test_performance() {
-    log_info "📊 Running performance baseline tests..."
-    if sudo -u postgres psql -c "EXPLAIN ANALYZE SELECT 1;" >/dev/null 2>&1; then
-        log_success "✅ Database performance OK"
-    fi
-    if redis-cli ping >/dev/null 2>&1; then
-        log_success "✅ Redis performance OK"
-    fi
-}
-
-# ------------------------------
-# Checkpoints & Monitoring
-# ------------------------------
-
-check_system_health() {
-    local disk_free=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
-    if [ "$disk_free" -lt 2 ]; then
-        dnf clean all >/dev/null 2>&1
-        journalctl --vacuum-size=100M >/dev/null 2>&1
-    fi
-    local mem_free=$(free -m | awk '/^Mem:/{print $4}')
-    if [ "$mem_free" -lt 500 ]; then
-        sync && echo 3 > /proc/sys/vm/drop_caches
-    fi
-}
-
-save_installation_checkpoint() {
-    local step="$1"
-    local checkpoint_dir="/var/tmp/nexuscafe_checkpoints"
-    mkdir -p "$checkpoint_dir"
-    cat > "$checkpoint_dir/last_checkpoint.json" << EOF
-{ "timestamp": "$(date -Iseconds)", "step": "$step", "progress": $(( (installation_step * 100) / 12 )) }
-EOF
-}
-
-smart_rollback() {
-    local failure_step="$1"
-    log_warning "🔄 Initiating rollback due to: $failure_step"
-    if [ -f /root/migration_backup_*.sql ]; then
-        sudo -u postgres psql -U nexuscafe nexuscafe < $(ls -t /root/migration_backup_*.sql | head -1) >/dev/null 2>&1 || true
-    fi
-    pm2 stop nexuscafe >/dev/null 2>&1 || true
-    systemctl stop nginx >/dev/null 2>&1 || true
-    rm -rf $INSTALL_DIR/{dist,build,node_modules} 2>/dev/null || true
-    log_success "✅ Rollback completed."
-}
-
-cleanup_installation() {
-    log_info "🧹 Cleaning up installation artifacts..."
-    rm -rf /var/tmp/nexuscafe_* 2>/dev/null || true
-    rm -f /tmp/nexuscafe_install_progress.txt 2>/dev/null || true
-    dnf clean all >/dev/null 2>&1 || true
-    find /root -name "migration_backup_*.sql" -mtime +7 -delete 2>/dev/null || true
-    log_success "✅ Cleanup completed"
-}
-
-# ------------------------------
-# Runner Definitions
-# ------------------------------
-
-run_step() {
-    local step_name=$1
-    case $step_name in
-        "system_update")
-            dnf update -y >/dev/null 2>&1 || return 1
-            ;;
-        "base_tools")
-            smart_install epel-release || return 1
-            smart_install git || return 1
-            smart_install curl || return 1
-            smart_install wget || return 1
-            smart_install nginx || return 1
-            smart_install redis || return 1
-            smart_install certbot || return 1
-            smart_install python3-certbot-nginx || return 1
-            smart_install postgresql-server || return 1
-            smart_install postgresql-contrib || return 1
-            ;;
-        "node_install")
-            smart_install_node || return 1
-            npm install -g pm2 >/dev/null 2>&1 || return 1
-            pm2 startup >/dev/null 2>&1 || true
-            ;;
-        "postgresql_setup")
-            smart_postgres_setup || return 1
-            ;;
-        "redis_setup")
-            systemctl enable redis >/dev/null 2>&1 || return 1
-            smart_service_start redis || return 1
-            ;;
-        "minio_setup")
-            if ! command_exists minio; then
-                wget -q https://dl.min.io/server/minio/release/linux-amd64/minio
-                chmod +x minio
-                mv minio /usr/local/bin/
-                useradd -r minio-user 2>/dev/null || true
-                mkdir -p /var/lib/minio /etc/minio
-                chown minio-user:minio-user /var/lib/minio
-                cat > /etc/minio/minio.conf << EOF
-MINIO_VOLUMES="/var/lib/minio"
-MINIO_OPTS="--address :${MINIO_PORT} --console-address :${MINIO_CONSOLE_PORT}"
-MINIO_ROOT_USER=nexuscafe-admin
-MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
-EOF
-                cat > /etc/systemd/system/minio.service << EOF
-[Unit]
-Description=MinIO
-Wants=network-online.target
-After=network-online.target
-[Service]
-User=minio-user
-Group=minio-user
-EnvironmentFile=/etc/minio/minio.conf
-ExecStart=/usr/local/bin/minio server \$MINIO_OPTS
-Restart=always
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-EOF
-                systemctl daemon-reload
-                systemctl enable minio >/dev/null 2>&1
-            fi
-            smart_service_start minio || return 1
-            ;;
-        "nginx_config")
-            cat > /etc/nginx/conf.d/${DOMAIN}.conf << EOF
+generate_nginx_config() {
+    cat > /etc/nginx/conf.d/${DOMAIN}.conf << EOF
 server {
     listen 80;
     server_name ${DOMAIN};
@@ -683,25 +818,27 @@ server {
     }
 }
 EOF
-            smart_service_start nginx || return 1
-            ;;
-        "ssl_certificate")
-            certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos --email ${ADMIN_EMAIL} >/dev/null 2>&1 || log_warning "Certbot failed, proceeding with HTTP fallback."
-            systemctl enable certbot-renew.timer >/dev/null 2>&1 || true
-            systemctl start certbot-renew.timer >/dev/null 2>&1 || true
-            ;;
-        "app_deployment")
-            mkdir -p $INSTALL_DIR
-            if [ ! -d "$INSTALL_DIR/.git" ]; then
-                git clone $REPO_URL $INSTALL_DIR >/dev/null 2>&1 || return 1
-            else
-                cd $INSTALL_DIR
-                git pull origin main >/dev/null 2>&1 || return 1
-            fi
-            cd $INSTALL_DIR
-            npm install >/dev/null 2>&1 || return 1
-            npm run build >/dev/null 2>&1 || return 1
-            cat > .env << EOF
+    systemctl restart nginx || return 1
+}
+
+setup_ssl_certificate() {
+    certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos --email ${ADMIN_EMAIL} >/dev/null 2>&1 || log_warning "Certbot failed, proceeding with HTTP fallback."
+    systemctl enable certbot-renew.timer >/dev/null 2>&1 || true
+    systemctl start certbot-renew.timer >/dev/null 2>&1 || true
+}
+
+deploy_application() {
+    mkdir -p $INSTALL_DIR
+    if [ ! -d "$INSTALL_DIR/.git" ]; then
+        git clone $REPO_URL $INSTALL_DIR >/dev/null 2>&1 || return 1
+    else
+        cd $INSTALL_DIR
+        git pull origin main >/dev/null 2>&1 || return 1
+    fi
+    cd $INSTALL_DIR
+    npm install >/dev/null 2>&1 || return 1
+    npm run build >/dev/null 2>&1 || return 1
+    cat > .env << EOF
 DATABASE_URL=postgresql://nexuscafe:${DB_PASSWORD}@localhost:5432/nexuscafe
 PORT=${BACKEND_PORT}
 REDIS_URL=redis://localhost:6379
@@ -713,13 +850,12 @@ MINIO_SECRET_KEY=${MINIO_PASSWORD}
 JWT_SECRET=${JWT_SECRET}
 NODE_ENV=production
 EOF
-            ;;
-        "database_migration")
-            smart_migrate_database || return 1
-            ;;
-        "pm2_startup")
-            cd $INSTALL_DIR
-            cat > ecosystem.config.js << EOF
+}
+
+setup_pm2() {
+    cd $INSTALL_DIR
+    npm install -g pm2 >/dev/null 2>&1 || true
+    cat > ecosystem.config.js << EOF
 module.exports = {
   apps: [{
     name: 'nexuscafe',
@@ -733,91 +869,266 @@ module.exports = {
   }]
 };
 EOF
-            pm2 start ecosystem.config.js >/dev/null 2>&1 || return 1
-            pm2 save >/dev/null 2>&1 || return 1
+    pm2 start ecosystem.config.js >/dev/null 2>&1 || return 1
+    pm2 save >/dev/null 2>&1 || return 1
+}
+
+# ------------------------------
+# Orchestration & Execution
+# ------------------------------
+
+check_step_status() {
+    local step_name="$1"
+    local checkpoint_file="/var/tmp/nexuscafe_checkpoints/${step_name}.done"
+    [ -f "$checkpoint_file" ]
+}
+
+mark_step_completed() {
+    local step_name="$1"
+    local checkpoint_dir="/var/tmp/nexuscafe_checkpoints"
+    mkdir -p "$checkpoint_dir"
+    touch "$checkpoint_dir/${step_name}.done"
+}
+
+recover_step() {
+    local step_name="$1"
+    case $step_name in
+        "redis_setup")
+            log_info "Cleaning up Redis installation and retrying..."
+            systemctl stop redis 2>/dev/null || true
+            pkill redis-server 2>/dev/null || true
+            dnf remove -y redis redis6 redis7 2>/dev/null || true
+            docker stop redis-nexuscafe 2>/dev/null || true
+            docker rm redis-nexuscafe 2>/dev/null || true
+            return 0
             ;;
-        "final_verification")
-            verify_installation || return 1
-            test_performance || true
+        "minio_setup")
+            cleanup_minio
+            return 0
+            ;;
+        *)
+            log_warning "No specific recovery for step: $step_name"
+            return 1
             ;;
     esac
 }
 
-# ------------------------------
-# Main Flow
-# ------------------------------
-
-main_installation() {
-    mkdir -p "$LOG_DIR"
+run_step() {
+    local step_name="$1"
+    local max_recovery_attempts=3
+    local recovery_attempt=0
     
-    START_TIME=$(date +%s)
-    declare -A steps=(
-        [1]="system_update"
-        [2]="base_tools"
-        [3]="node_install"
-        [4]="postgresql_setup"
-        [5]="redis_setup"
-        [6]="minio_setup"
-        [7]="nginx_config"
-        [8]="ssl_certificate"
-        [9]="app_deployment"
-        [10]="database_migration"
-        [11]="pm2_startup"
-        [12]="final_verification"
+    if check_step_status "$step_name"; then
+        log_info "Step already completed, skipping..."
+        return 0
+    fi
+    
+    while [ $recovery_attempt -lt $max_recovery_attempts ]; do
+        recovery_attempt=$((recovery_attempt + 1))
+        log_info "Executing step: $step_name (attempt $recovery_attempt/$max_recovery_attempts)"
+        
+        case $step_name in
+            "system_update") dnf update -y >/dev/null 2>&1 && dnf upgrade -y >/dev/null 2>&1 ;;
+            "base_tools") smart_install_base_tools ;;
+            "node_install") smart_install_node ;;
+            "postgresql_setup") smart_postgres_setup ;;
+            "redis_setup")
+                if smart_install_redis && configure_redis; then true; else return 1; fi
+                ;;
+            "minio_setup")
+                cleanup_minio
+                if smart_install_minio && configure_minio; then
+                    setup_minio_buckets || true
+                else
+                    return 1
+                fi
+                ;;
+            "nginx_config") generate_nginx_config ;;
+            "ssl_certificate") setup_ssl_certificate ;;
+            "app_deployment") deploy_application ;;
+            "database_migration") smart_migrate_database ;;
+            "pm2_startup") setup_pm2 ;;
+            "final_verification") verify_installation ;;
+            *) log_error "Unknown step: $step_name"; return 1 ;;
+        esac
+        
+        if [ $? -eq 0 ]; then
+            log_success "✅ Step $step_name completed successfully"
+            mark_step_completed "$step_name"
+            return 0
+        fi
+        
+        log_warning "Step $step_name failed (attempt $recovery_attempt/$max_recovery_attempts)"
+        
+        if [ $recovery_attempt -lt $max_recovery_attempts ]; then
+            log_info "🔄 Attempting recovery for step: $step_name"
+            if recover_step "$step_name"; then
+                log_success "✅ Step recovered successfully"
+            fi
+        fi
+    done
+    
+    log_error "❌ Step $step_name failed after $max_recovery_attempts attempts"
+    return 1
+}
+
+verify_installation() {
+    local errors=0
+    log_info "🔍 Verifying installation..."
+    
+    for service in nginx postgresql; do
+        if systemctl is-active --quiet "$service"; then
+            log_success "✅ $service is running"
+        else
+            log_error "❌ $service is not running"
+            errors=$((errors + 1))
+        fi
+    done
+    
+    if redis-cli ping >/dev/null 2>&1 || docker ps | grep -q redis-nexuscafe; then
+        log_success "✅ redis is running"
+    else
+        log_error "❌ redis is not running"
+        errors=$((errors + 1))
+    fi
+
+    if curl -s -o /dev/null http://localhost:${MINIO_PORT}/minio/health/ready || docker ps | grep -q minio-nexuscafe; then
+        log_success "✅ minio is running"
+    else
+        log_error "❌ minio is not running"
+        errors=$((errors + 1))
+    fi
+    
+    if pm2 status 2>/dev/null | grep -q "online"; then
+        log_success "✅ Application is running"
+    else
+        log_error "❌ Application is not running"
+        errors=$((errors + 1))
+    fi
+    
+    if sudo -u postgres psql -c "SELECT 1" >/dev/null 2>&1; then
+        log_success "✅ Database is accessible"
+    else
+        log_error "❌ Database is not accessible"
+        errors=$((errors + 1))
+    fi
+    
+    if [ $errors -eq 0 ]; then
+        log_success "🎉 All core checks passed!"
+        return 0
+    else
+        return 1
+    fi
+}
+
+show_completion_info() {
+    echo ""
+    echo "📋 Next Steps:"
+    echo "1. Configure ZATCA settings in the admin panel"
+    echo "2. Set up inventory and menu items"
+    echo "3. Create employee accounts"
+    echo "4. Configure loyalty program"
+    echo ""
+    echo "🔐 Default Admin Login:"
+    echo "   Email: admin@nexuscafe.com"
+    echo "   Password: admin123 (Change immediately!)"
+    echo ""
+}
+
+main() {
+    echo "========================================="
+    echo "  NexusCafe Installation Script v3.0"
+    echo "  Self-Healing & Smart Recovery"
+    echo "========================================="
+    
+    mkdir -p /var/tmp/nexuscafe_checkpoints
+    mkdir -p /var/log/nexuscafe
+    
+    log_info "Running pre-flight checks..."
+    check_environment
+    optimize_environment
+    
+    local steps=(
+        "system_update"
+        "base_tools"
+        "node_install"
+        "postgresql_setup"
+        "redis_setup"
+        "minio_setup"
+        "nginx_config"
+        "ssl_certificate"
+        "app_deployment"
+        "database_migration"
+        "pm2_startup"
+        "final_verification"
     )
     
-    for step in $(seq 1 ${#steps[@]}); do
-        installation_step=$step
-        local step_name="${steps[$step]}"
+    local total_steps=${#steps[@]}
+    local completed=0
+    local failed_steps=()
+    
+    for i in "${!steps[@]}"; do
+        step_index=$((i + 1))
+        step_name="${steps[$i]}"
         
-        log_info "▶️  Step $step/$(( ${#steps[@]} )): $step_name"
+        log_info "▶️  Step $step_index/$total_steps: $step_name"
         
-        if execute_with_timeout 1800 run_step "$step_name"; then
-            log_success "✅ Step $step completed: $step_name"
+        if run_step "$step_name"; then
+            completed=$((completed + 1))
         else
-            log_error "❌ Step $step failed: $step_name"
-            if self_healing_recovery "$step_name"; then
-                log_success "✅ Recovery successful for: $step_name"
-            else
-                log_error "❌ Recovery failed for: $step_name"
+            failed_steps+=("$step_name")
+            
+            if [ ${#failed_steps[@]} -gt 2 ]; then
+                log_error "Multiple failures detected. Installation may be unstable."
                 read -p "Continue with remaining steps? (y/n): " continue_install
                 if [[ ! "$continue_install" =~ ^[Yy]$ ]]; then
-                    log_error "Installation aborted at step $step."
-                    gather_diagnostics
-                    smart_rollback "$step_name"
+                    log_error "Installation aborted."
                     exit 1
                 fi
             fi
         fi
         
-        check_system_health
-        save_installation_checkpoint "$step_name"
-        echo "$(( (step * 100) / ${#steps[@]} ))" > /tmp/nexuscafe_install_progress.txt
+        local progress=$((completed * 100 / total_steps))
+        echo "Progress: $progress% ($completed/$total_steps)"
     done
     
-    END_TIME=$(date +%s)
-    log_success "🎉 Installation completed successfully in $(((END_TIME - START_TIME) / 60)) minutes"
-    touch $INSTALL_DIR/.installation_complete
-    cleanup_installation
+    echo "========================================="
+    echo "  Installation Complete"
+    echo "========================================="
+    
+    if [ ${#failed_steps[@]} -eq 0 ]; then
+        log_success "🎉 ALL STEPS COMPLETED SUCCESSFULLY!"
+        show_completion_info
+    else
+        log_warning "⚠️ Installation completed with ${#failed_steps[@]} failed steps:"
+        for step in "${failed_steps[@]}"; do
+            log_warning "  - $step"
+        done
+        log_info "Check the installation log for details: /var/log/nexuscafe/install.log"
+    fi
+    
+    echo ""
+    echo "========================================="
+    echo "  🌐 Access NexusCafe"
+    echo "========================================="
+    echo "  URL: https://${DOMAIN}"
+    echo "  Backend Port: ${BACKEND_PORT}"
+    echo "  Socket Port: ${SOCKET_PORT}"
+    echo "  MinIO Port: ${MINIO_PORT}"
+    echo "  MinIO Console: http://localhost:${MINIO_CONSOLE_PORT}"
+    echo ""
+    echo "  📦 Credentials saved to: /root/nexuscafe-credentials.txt"
+    echo "  📋 Installation log: /var/log/nexuscafe/install.log"
+    echo "========================================="
 }
 
 # ------------------------------
 # Entrypoint
 # ------------------------------
 
-if [ "$EUID" -ne 0 ]; then
-    log_error "Please run as root (sudo ./install-nexuscafe.sh)"
-fi
-
-BACKEND_PORT=$(find_available_port 3000)
-SOCKET_PORT=$(find_available_port 4000)
-MINIO_PORT=$(find_available_port 9000)
-MINIO_CONSOLE_PORT=$(find_available_port 9001)
 DB_PASSWORD=$(generate_password)
 MINIO_PASSWORD=$(generate_password)
 JWT_SECRET=$(generate_password)
-
-check_system_readiness
 
 while [ -z "$DOMAIN" ]; do
     read -p "Enter your domain (e.g., nexuscafe.yourdomain.com): " DOMAIN
@@ -833,14 +1144,19 @@ log_warning "This will install NexusCafe on domain: $DOMAIN"
 read -p "Continue? (y/n): " confirm
 if [[ ! "$confirm" =~ ^[Yy]$ ]]; then exit 0; fi
 
-main_installation | tee -a "$LOG_DIR/install.log"
+# Execute main process and capture output to log file in parallel
+{
+    main
+} 2>&1 | tee -a "$LOG_DIR/install.log"
 
-# Save Credentials
+# Save Credentials outside subshell
 cat > /root/nexuscafe-credentials.txt << EOF
 NexusCafe Installation Credentials
 ==================================
 Domain: $DOMAIN
 Backend Port: $BACKEND_PORT
+Socket Port: $SOCKET_PORT
+MinIO Port: $MINIO_PORT
 Database Name: nexuscafe
 Database User: nexuscafe
 Database Password: $DB_PASSWORD

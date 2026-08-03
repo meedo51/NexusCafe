@@ -1,0 +1,25 @@
+--- src/routes/scheduling.ts
++++ src/routes/scheduling.ts
+@@ -148,6 +148,22 @@
+     if (!trade || !trade.acceptorId) {
+       return res.status(400).json({ error: "Invalid trade state" });
+     }
++    
++    // Validate coverage requirements
++    const [shift] = await db.select().from(scheduledShifts).where(eq(scheduledShifts.id, trade.shiftId));
++    if (shift) {
++      const acceptorShifts = await db.select().from(scheduledShifts)
++        .where(
++          and(
++            eq(scheduledShifts.userId, trade.acceptorId),
++            eq(scheduledShifts.date, shift.date)
++          )
++        );
++      
++      if (acceptorShifts.length > 0) {
++        return res.status(400).json({ error: "Acceptor already has a shift on this day (coverage conflict)." });
++      }
++    }
+ 
+     const [updated] = await db.update(shiftTrades)
+       .set({ managerApprovalId, status: 'APPROVED' })
